@@ -133,13 +133,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url?.startsWith("/vercel")) {
-    const headerName = "x-vercel-verify";
-    if (req.headers[headerName] || VERCEL_VERIFY_TOKEN) {
-      res.writeHead(200, { "x-vercel-verify": VERCEL_VERIFY_TOKEN, "Content-Type": "text/plain" });
-      res.end(VERCEL_VERIFY_TOKEN || "ok");
-      return;
-    }
+  if ((req.method === "GET" || req.method === "HEAD") && req.url?.startsWith("/vercel")) {
+    const incoming = req.headers["x-vercel-verify"];
+    const verify = (typeof incoming === "string" && incoming) || VERCEL_VERIFY_TOKEN || "ok";
+    res.writeHead(200, { "x-vercel-verify": verify, "Content-Type": "text/plain" });
+    res.end(verify);
+    return;
   }
 
   if (req.method === "POST" && req.url?.startsWith("/vercel")) {
