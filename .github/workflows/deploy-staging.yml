@@ -88,8 +88,9 @@ jobs:
           ENVIRONMENT_ID=$(read_secret 'railway/environment-id')
           SERVICE_ID=$(read_secret 'railway/services/vercel-otlp')
           INGEST_TOKEN=$(read_secret 'signoz/ingest-token')
+          VERIFY_TOKEN=$(read_secret 'vercel-otlp/verify-token')
 
-          for v in "$RAILWAY_TOKEN" "$INGEST_TOKEN"; do
+          for v in "$RAILWAY_TOKEN" "$INGEST_TOKEN" "$VERIFY_TOKEN"; do
             echo "::add-mask::$v"
           done
 
@@ -99,6 +100,7 @@ jobs:
             echo "ENVIRONMENT_ID=$ENVIRONMENT_ID"
             echo "SERVICE_ID=$SERVICE_ID"
             echo "INGEST_TOKEN=$INGEST_TOKEN"
+            echo "VERIFY_TOKEN=$VERIFY_TOKEN"
           } >> "$GITHUB_ENV"
 
       - name: Sync env vars to Railway
@@ -106,10 +108,11 @@ jobs:
           set -euo pipefail
           ENVVARS=$(jq -nc \
             --arg ingest "$INGEST_TOKEN" \
+            --arg verify "$VERIFY_TOKEN" \
             '{
               SIGNOZ_INGEST_TOKEN: $ingest,
               SIGNOZ_OTLP_URL: "http://otel-collector.railway.internal:4318/v1/logs",
-              VERCEL_VERIFY_TOKEN: "",
+              VERCEL_VERIFY_TOKEN: $verify,
               VERCEL_LOG_DRAIN_SECRET: ""
             }')
 
