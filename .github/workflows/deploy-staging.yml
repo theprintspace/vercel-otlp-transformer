@@ -1,0 +1,170 @@
+name: Deploy to staging
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [staging]
+
+permissions:
+  contents: read
+  packages: write
+
+# Per-service deploy workflow for vercel-otlp-transformer (staging).
+# Tiny Node.js receiver: accepts Vercel log-drain POSTs at /vercel,
+# transforms each entry into OTLP/JSON format, and POSTs to the SigNoz
+# otel-collector with the SIGNOZ_INGEST_TOKEN bearer.
+#
+# Custom domain: vercel-otlp.staging.creativehub.io (Vercel log drain
+# target). Reaches otel-collector via internal DNS at
+# otel-collector.railway.internal:4318/v1/logs.
+#
+# Required setup:
+#   1. Repo secret OP_SERVICE_ACCOUNT_TOKEN — staging SA from Engineering vault.
+#   2. 1Password vault `tps-infra-staging`:
+#        railway/api-token, railway/project-id, railway/environment-id
+#        railway/services/vercel-otlp
+#        signoz/ingest-token (shared with otel-collector)
+#
+# Deferred (set to empty in workflow — verification still works since
+# server.js short-circuits on empty values):
+#   - vercel-otlp/verify-token: comes from Vercel's log-drain creation
+#     flow post-deploy; we'll wire it back via 1P after first signup.
+#   - vercel-otlp/log-drain-secret: optional HMAC verification.
+
+env:
+  IMAGE_REPO: ghcr.io/theprintspace/vercel-otlp-transformer
+  RAILWAY_GRAPHQL: https://backboard.railway.com/graphql/v2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build + push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPO }}:${{ github.sha }}
+            ${{ env.IMAGE_REPO }}:staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@v1
+
+      - name: Load secrets from 1Password
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+          VAULT='tps-infra-staging'
+
+          read_secret() {
+            local title="$1"
+            local val
+            val=$(op item get "$title" --vault "$VAULT" --fields password --reveal 2>/dev/null || true)
+            if [ -z "$val" ]; then
+              echo "::error::Required vault item '$title' missing or empty in $VAULT" >&2
+              return 1
+            fi
+            echo "$val"
+          }
+
+          RAILWAY_TOKEN=$(read_secret 'railway/api-token')
+          PROJECT_ID=$(read_secret 'railway/project-id')
+          ENVIRONMENT_ID=$(read_secret 'railway/environment-id')
+          SERVICE_ID=$(read_secret 'railway/services/vercel-otlp')
+          INGEST_TOKEN=$(read_secret 'signoz/ingest-token')
+
+          for v in "$RAILWAY_TOKEN" "$INGEST_TOKEN"; do
+            echo "::add-mask::$v"
+          done
+
+          {
+            echo "RAILWAY_TOKEN=$RAILWAY_TOKEN"
+            echo "PROJECT_ID=$PROJECT_ID"
+            echo "ENVIRONMENT_ID=$ENVIRONMENT_ID"
+            echo "SERVICE_ID=$SERVICE_ID"
+            echo "INGEST_TOKEN=$INGEST_TOKEN"
+          } >> "$GITHUB_ENV"
+
+      - name: Sync env vars to Railway
+        run: |
+          set -euo pipefail
+          ENVVARS=$(jq -nc \
+            --arg ingest "$INGEST_TOKEN" \
+            '{
+              SIGNOZ_INGEST_TOKEN: $ingest,
+              SIGNOZ_OTLP_URL: "http://otel-collector.railway.internal:4318/v1/logs",
+              VERCEL_VERIFY_TOKEN: "",
+              VERCEL_LOG_DRAIN_SECRET: ""
+            }')
+
+          VARS_GQL=$(echo "$ENVVARS" | jq -r '
+            to_entries | map(
+              (.key | gsub("\""; "\\\"")) + ": " +
+              (.value | tojson)
+            ) | join(", ")
+          ')
+
+          body=$(jq -nc \
+            --arg pid "$PROJECT_ID" --arg eid "$ENVIRONMENT_ID" --arg sid "$SERVICE_ID" \
+            --arg vars "$VARS_GQL" \
+            '{query: "mutation { variableCollectionUpsert(input: { projectId: \"\($pid)\", environmentId: \"\($eid)\", serviceId: \"\($sid)\", replace: false, variables: { \($vars) } }) }"}')
+          response=$(curl -fsS -X POST "$RAILWAY_GRAPHQL" \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" -d "$body")
+          if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "::error::variableCollectionUpsert: $(echo "$response" | jq -r '.errors[0].message')"
+            exit 1
+          fi
+          echo "::notice::Synced $(echo "$ENVVARS" | jq 'length') env vars"
+
+      - name: Update Railway service source + deploy
+        env:
+          IMAGE: ${{ env.IMAGE_REPO }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          source_input=$(jq -nc --arg img "$IMAGE" '{image: $img}')
+          input_obj=$(jq -nc --argjson src "$source_input" '{source: $src}')
+          body=$(jq -nc \
+            --arg eid "$ENVIRONMENT_ID" --arg sid "$SERVICE_ID" \
+            --argjson input "$input_obj" \
+            '{
+              query: "mutation($eid: String!, $sid: String!, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(environmentId: $eid, serviceId: $sid, input: $input) }",
+              variables: { eid: $eid, sid: $sid, input: $input }
+            }')
+          response=$(curl -fsS -X POST "$RAILWAY_GRAPHQL" \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" -d "$body")
+          if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "::error::serviceInstanceUpdate: $(echo "$response" | jq -r '.errors[0].message')"
+            exit 1
+          fi
+          echo "::notice::Updated source → $IMAGE"
+
+          body=$(jq -nc \
+            --arg eid "$ENVIRONMENT_ID" --arg sid "$SERVICE_ID" \
+            '{query: "mutation { serviceInstanceDeploy(environmentId: \"\($eid)\", serviceId: \"\($sid)\") }"}')
+          response=$(curl -fsS -X POST "$RAILWAY_GRAPHQL" \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" -d "$body")
+          if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+            msg=$(echo "$response" | jq -r '.errors[0].message')
+            echo "::warning::serviceInstanceDeploy: $msg (likely already deploying)"
+          else
+            echo "::notice::Deploy triggered"
+          fi
