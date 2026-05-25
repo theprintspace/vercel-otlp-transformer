@@ -1,8 +1,8 @@
 name: Deploy to production
 
 on:
-  workflow_dispatch:
-
+  push:
+    branches: [production]
 permissions:
   contents: read
   packages: write
