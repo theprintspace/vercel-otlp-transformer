@@ -126,7 +126,17 @@ async function forwardToSignoz(payload) {
   }
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  // http.createServer never awaits the handler: a rejection from it is an
+  // unhandled rejection, which Node turns into a crash. Answer 500 instead.
+  handle(req, res).catch((err) => {
+    console.error("request failed:", err.message);
+    if (res.headersSent) res.destroy();
+    else { res.writeHead(500); res.end(); }
+  });
+});
+
+async function handle(req, res) {
   if (VERCEL_VERIFY_TOKEN) {
     res.setHeader("x-vercel-verify", VERCEL_VERIFY_TOKEN);
   }
@@ -147,7 +157,18 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "POST" && req.url?.startsWith("/vercel")) {
     const chunks = [];
-    for await (const c of req) chunks.push(c);
+    try {
+      for await (const c of req) chunks.push(c);
+    } catch (err) {
+      // Vercel gave up on the delivery mid-body (ECONNRESET "aborted"). There
+      // is nobody to answer; it will retry. This rejection used to escape the
+      // async handler and take the whole process down — on 1 Oct 2026 three
+      // such aborts in five seconds exhausted Railway's restart policy and the
+      // drain stayed dark for a week.
+      console.warn("delivery aborted by the client:", err.code || err.message);
+      res.destroy();
+      return;
+    }
     const buf = Buffer.concat(chunks);
 
     if (VERCEL_LOG_DRAIN_SECRET) {
@@ -186,8 +207,12 @@ const server = http.createServer(async (req, res) => {
 
   res.writeHead(404);
   res.end("not found");
-});
+}
 
-server.listen(PORT, () => {
-  console.log(`vercel-otlp-transformer listening on :${PORT}`);
-});
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`vercel-otlp-transformer listening on :${PORT}`);
+  });
+}
+
+module.exports = { server };
